@@ -159,8 +159,8 @@ def clip_classifier(classnames, template, clip_model): # clip_weights = clip_cla
             class_embedding /= class_embedding.norm() # function from the downloaded model
             clip_weights.append(class_embedding)
 
-        clip_weights = torch.stack(clip_weights, dim=1).cuda() # in order to compute cosine similarity, # stack the classes
-    return clip_weights
+        clip_weights = torch.stack(clip_weights, dim=1).cuda() # in order to compute cosine similarity, # stack the classes, each column is a class
+    return clip_weights # dim = embedding_dim * num_classes
 
 
 def get_arguments():
@@ -201,7 +201,8 @@ def search_hp(cfg, cache_keys, cache_values, features, labels, clip_weights):
 
     return best_gamma, best_omega, best_alpha
 
-#-------------------------------------------------------------------------------------------------
+
+
 
 def main():
     args = get_arguments()
@@ -243,6 +244,7 @@ def main():
     # Construct the cache model
     print("\nConstructing cache model by few-shot visual features and labels.")
     cache_keys, cache_values = build_cache_model(cfg, clip_model, train_loader_cache) # return the cache information, HAVEN"T TAKE TOP K FROM EACH CLASS
+    # THE TRAIN IS THE CACHE
 
     # Pre-load val features
     print("\nLoading visual features and labels from val set.")
@@ -267,82 +269,86 @@ def main():
     acc = cls_acc(clip_logits_test, test_labels) # the default argument for topk is 1, get most probable class
     print("\n**** Zero-shot CLIP's test accuracy: {:.3f}. ****\n".format(acc))
 
-
-
-
-
-
-
-
-
-
-
-
-
-
+#--------------------------------------------------------------------------------------------------------------------------------------
+    
     # Retrieval Augmented CLIP 
     gamma, omega, alpha = cfg['init_gamma'], cfg['init_omega'], cfg['init_alpha']
-
-
-    # cache_keys current dimension = (feature_dim, num_images), need to turn it into (feature_dim, num_classes) by taking top k from each class, average over the k
-    ra_logits = val_features @ cache_keys # upper branch, need to get top k similar images to input
 
 #-------------------------------------------------------------------- # I2I
 
     if cfg["method"] == "I2I":
 
-        # cache_values contains all targets / labels in order
-        # GET TOP K IMAGES FROM EACH CLASS, N --> CK
-        # split into classes
-        temp = torch.bincount(cache_values)
-        toConcat = []
+        val_counts = torch.bincount(val_labels)
         curr = 0
-        for i in temp:
-            temptorch = ra_logits[:, curr:curr + i] # dim = num_img_in_test_set * bincount (X)
-            kEntries = temptorch.topk(cfg["k"], 1, True, False)[0] # dim = num_img_in_test_set * k, returns the k largest elements (largest cosine similarities) of the given input tensor along a given dimension, we choose columns here
+        final_cache_indices = []
+        for i in val_counts:
+            if i > 0:
+                currClass = val_features[curr:curr + i, :]   # dim = num_in_each_class_in_val * feature_dim
+                indices = torch.randperm(currClass.size(dim = 0))[:cfg["nc"]]
+                currSeeds = currClass[indices, :]    # dim = nc * feature_dim
 
-            kEntries = ((-1) * (omega - omega * kEntries)).exp() # @ cache_values (!TODO CHECK!)
+                currSimils = currSeeds @ cache_keys    # dim = nc * num_images_in_cache
+                currSimils_flat = currSimils.flatten()
+                max_indices_currClass = torch.topk(currSimils_flat, k = cfg["k"], largest = True, sorted = False).indices
+                max_col_indices_currClass = max_indices_currClass % currSimils.size(dim = 1)
+                final_cache_indices.append(max_col_indices_currClass)    # dim = num_classes * K
 
-            kEntries = kEntries.mean(dim = 1) # dim = num_img_in_test_set * 1  , 1x1
-            toConcat.append(kEntries) # later, toConcat will have dim = num_classes * num_img_in_test_set
+                # for each class, get the number in each class in the valSet, choose nc random of them, find cosine similarities of them
+                # with the cache images, get the top k
+
             curr += i
-        
-        cache_logits = toConcat.t() # dim = num_img_in_test_set * num_classes (C)
+
+        final_cache_indices = torch.cat(final_cache_indices, dim = 0)
+        final_cache_features = cache_keys[:, final_cache_indices]
+
+        tempInd = 0
+        avgFeats = []
+        for i in range(len(val_counts)):
+            currClass_avg_feats = final_cache_features[:, tempInd:(tempInd + cfg["k"])]
+            toAdd = currClass_avg_feats.mean(dim = 1)
+            avgFeats.append(toAdd)
+            avgFeats = torch.concat(avgFeats, dim = 1)
+            tempInd += cfg["k"]
 
 #-------------------------------------------------------------------- # T2I
 
-    elif cfg["method"] == "T2I":
+    elif cfg["method"] == "T2I":     # assume access to class names in target dataset
 
+        # clip_weights # dim = embedding_dim * num_classes
+        # val_features # dim = num_images * embedding_dim
+        clip_weights_t = clip_weights.t()
+        currSimils = clip_weights_t @ cache_keys # dim = num_images_in_cache * num_classes
+        currSimils_flat = currSimils.flatten()
+        max_indices_currClass = torch.topk(currSimils_flat, k = cfg["k"], largest = True, sorted = False).indices
+        max_col_indices_currClass = max_indices_currClass % currSimils.size(dim = 1)
+        final_cache_indices.append(max_col_indices_currClass) # dim = num_classes * K
 
+        final_cache_indices = torch.cat(final_cache_indices, dim = 0)
+        final_cache_features = cache_keys[:, final_cache_indices] # NEED TO CHECK IF CAN DUPLICATE
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        tempInd = 0
+        avgFeats = []
+        for i in range(len(val_counts)):
+            currClass_avg_feats = final_cache_features[:, tempInd:(tempInd + cfg["k"])]
+            toAdd = currClass_avg_feats.mean(dim = 1)
+            avgFeats.append(toAdd)
+            avgFeats = torch.concat(avgFeats, dim = 1)
+            tempInd += cfg["k"]
 
 #--------------------------------------------------------------------
-    
-    ra_logits = (clip_logits_val * alpha) + (cache_logits * gamma) # dim = num_img_in_test_set * num_classes
+
+    # val_features has dim = num_images_in_val_set * feature_dim
+    upper_cache_logits = val_features @ final_cache_features # upper branch, need to get top k similar images to input
+    # dim = num_images_in_val_set * k
+    # clip_logits_val, dim = num_img_in_val_set * num_classes 
+    ra_logits = (clip_logits_val * alpha) + (upper_cache_logits * gamma) # dim = num_img_in_test_set * num_classes
     acc = cls_acc(ra_logits, val_labels)
     print("**** Retrieval Augmented CLIP's val accuracy: {:.3f}. ****\n".format(acc))
 
 
-#--------------------------------------------------------------------
-
     # Search Hyperparameters
     best_gamma, best_omega, best_alpha = search_hp(cfg, cache_keys, cache_values, val_features, val_labels, clip_weights) # !TODO
 
-#--------------------------------------------------------------------
 
     ra_logits = test_features @ cache_keys
     cache_logits = ((-1) * (best_omega - best_omega * ra_logits)).exp() @ cache_values
