@@ -1,6 +1,5 @@
 import os
 import random
-import os.path as osp
 import tarfile
 import zipfile
 from collections import defaultdict
@@ -21,33 +20,10 @@ def read_json(fpath):
 
 def write_json(obj, fpath):
     """Writes to a json file."""
-    if not osp.exists(osp.dirname(fpath)):
-        os.makedirs(osp.dirname(fpath))
+    if not os.path.exists(os.path.dirname(fpath)):
+        os.makedirs(os.path.dirname(fpath))
     with open(fpath, 'w') as f:
         json.dump(obj, f, indent=4, separators=(',', ': '))
-
-
-def read_image(path):
-    """Read image from path using ``PIL.Image``.
-
-    Args:
-        path (str): path to an image.
-
-    Returns:
-        PIL image
-    """
-    if not osp.exists(path):
-        raise IOError('No file exists at {}'.format(path))
-
-    while True:
-        try:
-            img = Image.open(path).convert('RGB')
-            return img
-        except IOError:
-            print(
-                'Cannot read image from {}, '
-                'probably due to heavy IO. Will re-try'.format(path)
-            )
 
 
 def listdir_nohidden(path, sort=False):
@@ -147,6 +123,7 @@ class DatasetBase:
     def num_classes(self):
         return self._num_classes
 
+    # EXTRA FUNCTIONS
     def get_num_classes(self, data_source):
         """Count number of classes.
 
@@ -172,40 +149,6 @@ class DatasetBase:
         labels.sort()
         classnames = [mapping[label] for label in labels]
         return mapping, classnames
-
-    def check_input_domains(self, source_domains, target_domains):
-        self.is_input_domain_valid(source_domains)
-        self.is_input_domain_valid(target_domains)
-
-    def is_input_domain_valid(self, input_domains):
-        for domain in input_domains:
-            if domain not in self.domains:
-                raise ValueError(
-                    'Input domain must belong to {}, '
-                    'but got [{}]'.format(self.domains, domain)
-                )
-
-    def download_data(self, url, dst, from_gdrive=True):
-        if not osp.exists(osp.dirname(dst)):
-            os.makedirs(osp.dirname(dst))
-
-        if from_gdrive:
-            gdown.download(url, dst, quiet=False)
-        else:
-            raise NotImplementedError
-
-        print('Extracting file ...')
-
-        try:
-            tar = tarfile.open(dst)
-            tar.extractall(path=osp.dirname(dst))
-            tar.close()
-        except:
-            zip_ref = zipfile.ZipFile(dst, 'r')
-            zip_ref.extractall(osp.dirname(dst))
-            zip_ref.close()
-
-        print('File extracted to {}'.format(osp.dirname(dst)))
 
     def generate_fewshot_dataset(
         self, *data_sources, num_shots=-1, cache_keys, repeat=True
@@ -251,39 +194,25 @@ class DatasetBase:
 
         return output
 
-    def split_dataset_by_label(self, data_source):
+    def split_dataset_by_label(self, data_source):  # IMPORTANT
         """Split a dataset, i.e. a list of Datum objects,
         into class-specific groups stored in a dictionary.
 
         Args:
             data_source (list): a list of Datum objects.
         """
-        output = defaultdict(list)
+        output = defaultdict(list) # create new list if key not present
 
         for item in data_source:
             output[item.label].append(item)
-
+            
         return output
-
-    def split_dataset_by_domain(self, data_source):
-        """Split a dataset, i.e. a list of Datum objects,
-        into domain-specific groups stored in a dictionary.
-
-        Args:
-            data_source (list): a list of Datum objects.
-        """
-        output = defaultdict(list)
-
-        for item in data_source:
-            output[item.domain].append(item)
-
-        return output
-
+    
 
 class DatasetWrapper(TorchDataset):
     def __init__(self, data_source, input_size, transform=None, is_train=False,
                  return_img0=False, k_tfm=1):
-        self.data_source = data_source
+        self.data_source = data_source 
         self.transform = transform # accept list (tuple) as input
         self.is_train = is_train
         # Augmenting an image K>1 times is only allowed during training
@@ -314,12 +243,12 @@ class DatasetWrapper(TorchDataset):
         item = self.data_source[idx] # this is one Datum
 
         output = {
-            'label': item.label,
-            'domain': item.domain,
+            'label': item.label, # this has already been cast to an integer 
+            'domain': item.domain, 
             'impath': item.impath # this is already the full path to the image
         }
 
-        img0 = read_image(item.impath)
+        img0 = Image.open(item.impath).convert('RGB') # identify image location on disk, and convert it into a tensor
 
         if self.transform is not None:
             if isinstance(self.transform, (list, tuple)):

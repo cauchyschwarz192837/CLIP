@@ -17,7 +17,7 @@ class DataSet(DatasetBase):
 
     dataset_dir = 'dataset'
 
-    def __init__(self, root, num_shots):
+    def __init__(self, root):
         self.dataset_dir = os.path.join(root, self.dataset_dir)
         self.image_dir = os.path.join(self.dataset_dir, 'images')
         self.anno_dir = os.path.join(self.dataset_dir, 'annotations')
@@ -33,11 +33,11 @@ class DataSet(DatasetBase):
         super().__init__(train_x=train, val=val, test=test)
     
     
-    def read_split(filepath, path_prefix):
+    def read_split(filepath, image_dir_path): # train, val, test = self.read_split(self.split_path, self.image_dir)
         def _convert(items):
             out = []
             for impath, label, classname in items: # image file name, label index, class name, reading each entry in the JSON file
-                impath = os.path.join(path_prefix, impath)
+                impath = os.path.join(image_dir_path, impath)
                 item = Datum(
                     impath=impath,
                     label=int(label), # THIS IS AN INTEGER!!!!!
@@ -97,8 +97,8 @@ def pre_load_features(cfg, split, clip_model, loader):
             images, target = images.cuda(), target.cuda() # push to GPU
             image_features = clip_model.encode_image(images)
             image_features /= image_features.norm(dim=-1, keepdim=True)
-            features.append(image_features) # zeroth dimension is batch number
-            labels.append(target) # zeroth dimension is batch number
+            features.append(image_features)
+            labels.append(target)
 
     features, labels = torch.cat(features), torch.cat(labels)
 
@@ -117,7 +117,7 @@ def cls_acc(output, target, topk=1):# dim = num_img_in_test_set * num_classes, d
     return acc 
 
 
-def build_data_loader(
+def build_data_loader(    # arguments go to dataset_wrapper
     data_source=None,
     batch_size=64,
     input_size=224,
@@ -128,7 +128,7 @@ def build_data_loader(
 ):
 
     if dataset_wrapper is None:
-        dataset_wrapper = DatasetWrapper
+        dataset_wrapper = DatasetWrapper # see class definition
 
     # Build data loader
     data_loader = torch.utils.data.DataLoader( # provides an iterable over a dataset, with support for batching, shuffling, multi-threaded data loading, ... 
@@ -210,19 +210,18 @@ def main():
     
     cfg = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
 
-    cache_dir = os.path.join('./caches', "dataset")
-    os.makedirs(cache_dir, exist_ok=True) 
+    cache_dir = os.path.join('./caches', cfg["dataset"])
+    os.makedirs(cache_dir, exist_ok = True) 
     cfg['cache_dir'] = cache_dir
 
     # CLIP
     clip_model, preprocess = clip.load(cfg['backbone']) # loads a CLIP model and its associated preprocessing function
     clip_model.eval() # sets the model to evaluation mode, which changes the behavior of certain layers like dropout and batch normalization to be appropriate for inference rather than training
 
-    # Prepare dataset
     random.seed(1)
     torch.manual_seed(1)
 
-    dataset = DataSet(cfg['root_path'], cfg['shots']) # returns instance of dataset class, train val test Datums (classname)
+    dataset = DataSet(cfg['root_path']) # returns instance of dataset class, train val test Datums (classname)
 
     val_loader = build_data_loader(data_source=dataset.val, batch_size=64, is_train=False, tfm=preprocess, shuffle=False) # load batches of Datums
     test_loader = build_data_loader(data_source=dataset.test, batch_size=64, is_train=False, tfm=preprocess, shuffle=False)
@@ -239,21 +238,23 @@ def main():
     # Textual features
     print("\nGetting textual features as CLIP's classifier.")
     clip_weights = clip_classifier(dataset.classnames, dataset.template, clip_model) # fixed set of textual features, put classname in template here
-    # each column is a class
+    # each column is a class # dim = feature_dim * num_classes
 
     # Construct the cache model
     print("\nConstructing cache model by few-shot visual features and labels.")
     cache_keys, cache_values = build_cache_model(cfg, clip_model, train_loader_cache) # return the cache information, HAVEN"T TAKE TOP K FROM EACH CLASS
-    # THE TRAIN IS THE CACHE
+    # (feature_dim, num_images), (num_images,)
 
     # Pre-load val features
     print("\nLoading visual features and labels from val set.")
     val_features, val_labels = pre_load_features(cfg, "val", clip_model, val_loader)
     # to get labels, passed in data loader, which took in train subset of Datums and a DatasetWrapper argument (and a transform argument), which is inherited from DatasetBase, whose train_x is list of Datums made from JSON file, has a __getitem__ function to define what is returned / gotten
+    # (num_samples, feature_dim), (num_samples,)
 
     # Pre-load test features
     print("\nLoading visual features and labels from test set.")
     test_features, test_labels = pre_load_features(cfg, "test", clip_model, test_loader)
+    # (num_samples, feature_dim), (num_samples,)
 
 #---------------------------------------------------------------------------------------------------------------------
 
@@ -261,11 +262,12 @@ def main():
 
     # Zero-shot CLIP
     clip_logits_val = val_features @ clip_weights  # zeroth dimension / rows is number of images in val set
-    # dimension = num_img_in_test_set * num_classes 
+    # dimension = num_samples * num_classes 
     acc = cls_acc(clip_logits_val, val_labels) # the default argument for topk is 1
     print("\n**** Zero-shot CLIP's val accuracy: {:.3f}. ****\n".format(acc))
 
     clip_logits_test = test_features @ clip_weights
+    # dimension = num_samples * num_classes 
     acc = cls_acc(clip_logits_test, test_labels) # the default argument for topk is 1, get most probable class
     print("\n**** Zero-shot CLIP's test accuracy: {:.3f}. ****\n".format(acc))
 
@@ -276,83 +278,90 @@ def main():
 
 #-------------------------------------------------------------------- # I2I
 
+    final_cache_features = []
+
+
     if cfg["method"] == "I2I":
 
         val_counts = torch.bincount(val_labels)
         curr = 0
-        final_cache_indices = []
         for i in val_counts:
             if i > 0:
-                currClass = val_features[curr:curr + i, :]   # dim = num_in_each_class_in_val * feature_dim
+                currClass = val_features[curr:curr + i, :]
                 indices = torch.randperm(currClass.size(dim = 0))[:cfg["nc"]]
-                currSeeds = currClass[indices, :]    # dim = nc * feature_dim
+                currSeeds = currClass[indices, :]
 
-                currSimils = currSeeds @ cache_keys    # dim = nc * num_images_in_cache
+                currSimils = currSeeds @ cache_keys
                 currSimils_flat = currSimils.flatten()
                 max_indices_currClass = torch.topk(currSimils_flat, k = cfg["k"], largest = True, sorted = False).indices
                 max_col_indices_currClass = max_indices_currClass % currSimils.size(dim = 1)
-                final_cache_indices.append(max_col_indices_currClass)    # dim = num_classes * K
 
-                # for each class, get the number in each class in the valSet, choose nc random of them, find cosine similarities of them
-                # with the cache images, get the top k
+                for ind in max_col_indices_currClass:
+                    final_cache_features.append(cache_keys[:, ind].unsqueeze(1))
 
             curr += i
 
-        final_cache_indices = torch.cat(final_cache_indices, dim = 0)
-        final_cache_features = cache_keys[:, final_cache_indices]
-
-        tempInd = 0
-        avgFeats = []
-        for i in range(len(val_counts)):
-            currClass_avg_feats = final_cache_features[:, tempInd:(tempInd + cfg["k"])]
-            toAdd = currClass_avg_feats.mean(dim = 1)
-            avgFeats.append(toAdd)
-            avgFeats = torch.concat(avgFeats, dim = 1)
-            tempInd += cfg["k"]
+        final_cache_features = torch.cat(final_cache_features, dim = 1) # dim = feature_dim * num_classes x k (K-shot cache)
 
 #-------------------------------------------------------------------- # T2I
 
-    elif cfg["method"] == "T2I":     # assume access to class names in target dataset
+    elif cfg["method"] == "T2I":
 
-        # clip_weights # dim = embedding_dim * num_classes
-        # val_features # dim = num_images * embedding_dim
+        max_indices = []
         clip_weights_t = clip_weights.t()
-        currSimils = clip_weights_t @ cache_keys # dim = num_images_in_cache * num_classes
-        currSimils_flat = currSimils.flatten()
-        max_indices_currClass = torch.topk(currSimils_flat, k = cfg["k"], largest = True, sorted = False).indices
-        max_col_indices_currClass = max_indices_currClass % currSimils.size(dim = 1)
-        final_cache_indices.append(max_col_indices_currClass) # dim = num_classes * K
+        currSimils = clip_weights_t @ cache_keys
+        for i in range(dataset.num_classes):
+            currSimils_flat = currSimils[i, :]
+            max_indices_currClass = torch.topk(currSimils_flat, k = cfg["k"], largest = True, sorted = False).indices
+            max_indices.append(max_indices_currClass)
+        
+        max_indices = torch.cat(max_indices, dim = 0)
+        
+        for ind in max_indices:
+            final_cache_features.append(cache_keys[:, ind].unsqueeze(1))
 
-        final_cache_indices = torch.cat(final_cache_indices, dim = 0)
-        final_cache_features = cache_keys[:, final_cache_indices] # NEED TO CHECK IF CAN DUPLICATE
-
-        tempInd = 0
-        avgFeats = []
-        for i in range(len(val_counts)):
-            currClass_avg_feats = final_cache_features[:, tempInd:(tempInd + cfg["k"])]
-            toAdd = currClass_avg_feats.mean(dim = 1)
-            avgFeats.append(toAdd)
-            avgFeats = torch.concat(avgFeats, dim = 1)
-            tempInd += cfg["k"]
+        final_cache_features = torch.cat(final_cache_features, dim = 1)
 
 #--------------------------------------------------------------------
 
-    # val_features has dim = num_images_in_val_set * feature_dim
     upper_cache_logits = val_features @ final_cache_features # upper branch, need to get top k similar images to input
-    # dim = num_images_in_val_set * k
-    # clip_logits_val, dim = num_img_in_val_set * num_classes 
-    ra_logits = (clip_logits_val * alpha) + (upper_cache_logits * gamma) # dim = num_img_in_test_set * num_classes
+    upper_cache_logits = ((-1) * (omega - omega * upper_cache_logits)).exp() # @ cache_values # omega is a hyperparameter that modulates sharpness
+
+    temp_ind = 0
+    avg_logits = []
+    for i in range(dataset.num_classes):
+        currClass_avg_feats = upper_cache_logits[:, temp_ind:(temp_ind + cfg["k"])]
+        currClass_avg_feats = torch.mean(currClass_avg_feats, dim = 1) # dimension to reduce is the columns, simple arithmetic mean
+        avg_logits.append(currClass_avg_feats.unsqueeze(1))
+        temp_ind += cfg["k"]
+
+    avg_logits = torch.cat(avg_logits, dim = 1)
+
+    ra_logits = (clip_logits_val * alpha) + (avg_logits * gamma) # dim = num_img_in_test_set * num_classes
     acc = cls_acc(ra_logits, val_labels)
     print("**** Retrieval Augmented CLIP's val accuracy: {:.3f}. ****\n".format(acc))
 
+#--------------------------------------------------------------------
 
     # Search Hyperparameters
     best_gamma, best_omega, best_alpha = search_hp(cfg, cache_keys, cache_values, val_features, val_labels, clip_weights) # !TODO
 
+#--------------------------------------------------------------------
 
-    ra_logits = test_features @ cache_keys
-    cache_logits = ((-1) * (best_omega - best_omega * ra_logits)).exp() @ cache_values
-    
-    ra_logits = (clip_logits_test * best_alpha) + (cache_logits * best_gamma)
+    # val_features has dim = num_images_in_val_set * feature_dim
+    upper_cache_logits = test_features @ final_cache_features # upper branch, need to get top k similar images to input
+    upper_cache_logits = ((-1) * (best_omega - best_omega * upper_cache_logits)).exp() # @ cache_values # omega is a hyperparameter that modulates sharpness
+
+    temp_ind = 0
+    avg_logits = []
+    for i in range(dataset.num_classes):
+        currClass_avg_feats = upper_cache_logits[:, temp_ind:(temp_ind + cfg["k"])]
+        currClass_avg_feats = torch.mean(currClass_avg_feats, dim = 1) # dimension to reduce is the columns
+        avg_logits.append(currClass_avg_feats.unsqueeze(1))
+        temp_ind += cfg["k"]
+
+    avg_logits = torch.cat(avg_logits, dim = 1)
+
+    ra_logits = (clip_logits_test * best_alpha) + (avg_logits * best_gamma) # dim = num_img_in_test_set * num_classes
     acc = cls_acc(ra_logits, test_labels)
-    print("**** Retrieval Augmented CLIP's test accuracy: {:.3f}. ****\n".format(acc))   
+    print("**** Retrieval Augmented CLIP's test accuracy: {:.3f}. ****\n".format(acc))
