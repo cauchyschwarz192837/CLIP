@@ -20,7 +20,7 @@ class DataSet(DatasetBase):
     def __init__(self, root):
         self.dataset_dir = os.path.join(root, self.dataset_dir)
         self.image_dir = os.path.join(self.dataset_dir, 'images')
-        self.anno_dir = os.path.join(self.dataset_dir, 'annotations')
+        # self.anno_dir = os.path.join(self.dataset_dir, 'annotations')
         self.split_path = os.path.join(self.dataset_dir, 'split_DataSet.json')
 
         self.template = template
